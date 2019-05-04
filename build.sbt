@@ -21,7 +21,8 @@ libraryDependencies ++= Seq(
   "org.scala-lang" % "scala-library" % "2.11.12" % "provided",
   "org.apache.spark" %% "spark-sql" % "2.4.0" % "provided",
   "org.apache.spark" %% "spark-streaming" % "2.4.0" % "provided",
-
+  "com.cloudera.sparkts" % "sparkts" % "0.4.1",
+  "org.vegas-viz" %% "vegas-spark" % "0.3.6",
   "org.scalatest" %% "scalatest" % "2.2.6" % "test"
 )
 
