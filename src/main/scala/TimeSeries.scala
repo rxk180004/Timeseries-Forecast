@@ -1,34 +1,32 @@
-import java.text.SimpleDateFormat
 import java.time.format.DateTimeFormatter
 import java.time.{LocalDateTime, ZoneId, ZonedDateTime}
+import java.util.Random
 
 import org.apache.spark.sql.functions._
-import com.cloudera.sparkts.{BusinessDayFrequency, DateTimeIndex, DayFrequency, TimeSeriesRDD}
+import com.cloudera.sparkts.{DateTimeIndex, DayFrequency, TimeSeriesRDD}
 import com.cloudera.sparkts.models.ARIMA
 import org.apache.spark.mllib.linalg.{DenseVector, Vector}
-import org.apache.spark.sql.{DataFrame, Row, SparkSession}
-import org.joda.time.DateTime
+import org.apache.spark.sql.{Column, DataFrame, Row, SparkSession}
 import vegas._
 import vegas.render.WindowRenderer._
 import vegas.sparkExt._
 
 object TimeSeries {
 
+  // Sums columns in a dataframe
+  def sum(cols: Column*) = cols.foldLeft(lit(0))(_ + _)
+
   def plotDF(df: DataFrame, title: String, symbol: String, xLabel: String, yLabel: String) = {
 
     Vegas("Time Series Line Chart", width=500.0, height=300.0)
       .withDataFrame(df)
       .mark(Line)
-      //.encodeX("date", Temporal, timeUnit = TimeUnit.Yearmonth,
-      //  axis = Axis(axisWidth = 0.0, format = "%Y", labelAngle = 0.0, tickSize = Some(0.0)),
-      //  scale = Scale(nice = spec.Spec.NiceTimeEnums.Year)
-      //)
       .encodeX(xLabel, Temp)
       .encodeY(yLabel, Quant)
       .encodeColor(
         field=symbol,
         dataType=Nominal,
-        legend=Legend(orient="left", title="Stock Symbol"))
+        legend=Legend(orient="left", title="Legend"))
       .encodeDetailFields(Field(field=symbol, dataType=Nominal))
       .show
   }
@@ -80,11 +78,13 @@ object TimeSeries {
     // Get rid of log spam (should be called after the context is set up)
     setupLogging()
 
-    val inputPath = "data/train_min.csv" // args(0)
+    val inputPath = "data/train_1.csv" // args(0)
     println("inputPath: " + inputPath)
 
     val pageCol = "page"
     val predictedCol = "prediction"
+    val typeCol = "type"
+    val totalCol = "total"
     val daysToForecast = 10
     val zoneId = ZoneId.of("Z")
 
@@ -106,13 +106,24 @@ object TimeSeries {
 
     df = df.drop(colNames.tail(0))
 
-    df.show()
+    val dates = df.columns.tail
+
+    val columnsToSum = dates.map(col _).toList
+
+    // Calculate total hits for each page and store it as sum
+    df = df.withColumn(totalCol, columnsToSum.reduce(_ + _))
+
+    //df.sort(col(totalCol).desc).show()
+
+    // Get top 10 pages
+    var topPagesList = df.sort(col(totalCol).desc).take(10000).map(x => x.getString(0))
+
+    df = df.filter(col(pageCol).isin(topPagesList : _*))
 
     // Get start and end dates to build timeseries RDD
     val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
     val startDateStr = colNames(1) + " 00:00"
     val endDateStr = colNames(colNames.length - 1) + " 00:00"
-    print(startDateStr, endDateStr)
 
 
     val startDate = LocalDateTime.parse(startDateStr, formatter)
@@ -143,50 +154,48 @@ object TimeSeries {
 
     //val filledRDD = subslice.fill("linear")
 
-    tsRDD.toDF().show(1)
-    subslice.toDF().show(1)
+    //tsRDD.toDF().show(1)
+    //subslice.toDF().show(1)
 
     // filledRDD.toObservationsDataFrame
 
     print("Hello!!")
 
-    val newDF = subslice.mapSeries { vector => {
-      //val newVec = new DenseVector(vector.toArray.map(x => if (x.equals(Double.NaN)) 0 else x))
-      val arimaModel = ARIMA.fitModel(1, 0, 0, vector)
-      val forecasted = arimaModel.forecast(vector, daysToForecast)
+    val timeseriesDF = subslice.mapSeries { vector => {
+      val newVec = new DenseVector(vector.toArray.map(x => if (x.equals(Double.NaN)) 0 else x))
+      val arimaModel = ARIMA.fitModel(1, 0, 1, newVec)
+      //val arimaModel = ARIMA.autoFit(newVec)
+      //print(newVec.size, daysToForecast)
+      val forecasted = arimaModel.forecast(newVec, daysToForecast)
+
       //println ("forecast", forecasted.size - daysToForecast, forecasted.size, forecasted.size - (daysToForecast + 1), forecasted.size - 1)
       new DenseVector(forecasted.toArray.slice(forecasted.size - (daysToForecast + 1), forecasted.size))
     }
     }.toDF(pageCol, predictedCol)
 
-    newDF.show()
+    //timeseriesDF.show()
 
     //val dateFormat = new SimpleDateFormat("yyyy-MM-dd")
     val simpleDateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
     val forecastDates = (for (f <- 1 to daysToForecast) yield trainUntil.plusDays(f)).map(d => d.format(simpleDateFormat))
-    //println("size!! ", forecastDates.size)
+
     var totalErrorSquare = 0.0
 
     val vecToSeq = udf((v: Vector) => v.toArray)
 
     val exprs = (0 until daysToForecast).map(i => ($""+ predictedCol).getItem(i).alias(s"exploded_col$i"))
 
-    val getItem = udf((v: Vector, i: Int) => {
-      print(v, i)
-      v(i)
-    })
+    val getItem = udf((v: Vector, i: Int) => v(i))
 
-    //val getItem = udf((v: Vector, i: Int) => v(i))
-
+    // Converting dense vector into an array and type casting it to integers
     val toArr: Any => Array[Int] = _.asInstanceOf[DenseVector].toArray.map(_.toInt)
     val toArrUdf = udf(toArr)
-    var arrDF = newDF.withColumn("prediction_arr", toArrUdf('prediction))
+    var arrDF = timeseriesDF.withColumn("prediction_arr", toArrUdf('prediction))
 
 
     var fdf = forecastDates.zipWithIndex.foldLeft(arrDF) {
       (df, column) => {
-        // println("fdf", column._1, column._2)
         df.withColumn(column._1, col("prediction_arr")(column._2))
       }
     }
@@ -197,9 +206,9 @@ object TimeSeries {
 
     //fdf.show()
 
-    //val df2 = newDF.withColumn(predictedCol, vecToSeq($"prediction"))
+    //val df2 = timeseriesDF.withColumn(predictedCol, vecToSeq($"prediction"))
     //df2.show()
-    //newDF.select($"page", split($"prediction")).show
+    //timeseriesDF.select($"page", split($"prediction")).show
 
     //for (i <- (predicted.size - period) until predicted.size) {
     //  val errorSquare = Math.pow(predicted(i) - amounts(i), 2)
@@ -208,12 +217,12 @@ object TimeSeries {
     //}
     //println("Root Mean Square Error: " + Math.sqrt(totalErrorSquare/period))
 
-    //print(newDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values)
+    //print(timeseriesDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values)
 
-    //(forecastDates zip newDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values)
+    //(forecastDates zip timeseriesDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values)
     //  .map { case (date, hits) => (date, hits): (String, Double) }.toList
 
-    println(forecastDates)
+    println("forecated dates" ,forecastDates)
 
     //println("===========")
     //fdf.collect().map (row => {
@@ -224,26 +233,49 @@ object TimeSeries {
     //})
 
 
-    //val ttf = newDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values
+    //val ttf = timeseriesDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values
     //  .map { case (hits) => (hits): (Double) }.toList
 
     //print(ttf)
+    val size: Long = fdf.count
 
-    val toObsDF = toObservationsFormat(fdf, Seq(pageCol), "date", "views")
-    toObsDF.show()
-    plotDF(toObsDF, "fgfg", "page", "date", "views")
 
-    val testData = "data/testData.csv"
+    // Add type column to dataframe
+    val actualDF = df.select(pageCol, forecastDates: _*).withColumn("type", lit("actual"))
+    fdf = fdf.withColumn("type", lit("forecasted"))
 
-    var oDF = spark.read
-      .format("csv")
-      .option("header", "true") // first line in file has headers
-      .option("inferSchema","true")
-      .option("nullValue","defaultvalue")
-      .load(testData)
 
-    //oDF = oDF.withColumn("open", 'open.cast("Int"))
-    plotDF(oDF, "sfg", "symbol", "date", "open")
+    //fdf.show()
+
+    val combinedDFs = Seq(actualDF, fdf).reduce(_ union _) //actualDF union fdf
+    //combinedDFs.show(200)
+
+    val combinedDFObservationFormat = toObservationsFormat(combinedDFs, Seq(pageCol, typeCol), "date", "views")
+
+    val random = new Random
+    val sampleSize = 3
+    var index = 0
+
+    while (index < sampleSize) {
+      val rNum = 1 + random.nextInt(size.toInt)
+      val selectedPage = topPagesList(index)
+      print (selectedPage)
+      var filteredDF = combinedDFObservationFormat.filter(col(pageCol) === selectedPage)
+      //filteredDF.show()
+      filteredDF = filteredDF.drop(pageCol)
+      plotDF(filteredDF, selectedPage, typeCol, "date", "views")
+      index = index + 1
+    }
+
+
+    //val tempObsDF = toObservationsFormat(tempDF, Seq("type"), "date", "views")
+
+    //val toObsDF = toObservationsFormat(fdf, Seq(pageCol, typeCol), "date", "views")
+
+    //var actObsDF = toObservationsFormat(df, Seq(pageCol, typeCol), "date", "views")
+    //toObsDF.show()
+    //plotDF(toObsDF, "Forecasted", "page", "date", "views")
+    //plotDF(actObsDF, "Actual", "page", "date", "views")
   }
 }
 
