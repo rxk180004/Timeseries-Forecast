@@ -1,0 +1,11 @@
+
+
+Rank#1 Main page wikipedia (DE) all devices (Plot1)
+Wikipedia:Hauptseite_de.wikipedia.org_all-access_all-agents
+
+Rank#2 Search page (EN) all devices (Plot2)
+Special:Search_en.wikipedia.org_all-access_all-agents
+
+Rank#3 Main page wiki (DE) mobile (Plot3)
+Wikipedia:Hauptseite_de.wikipedia.org_mobile-web_all-agents
+

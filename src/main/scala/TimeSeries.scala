@@ -13,9 +13,21 @@ import vegas.sparkExt._
 
 object TimeSeries {
 
-  // Sums columns in a dataframe
+  /**
+    * Sums given columns in a dataframe row wise
+    * @param cols
+    * @return
+    */
   def sum(cols: Column*) = cols.foldLeft(lit(0))(_ + _)
 
+  /**
+    * Plots timeseries data using Vegas library
+    * @param df
+    * @param title
+    * @param symbol
+    * @param xLabel
+    * @param yLabel
+    */
   def plotDF(df: DataFrame, title: String, symbol: String, xLabel: String, yLabel: String) = {
 
     Vegas("Time Series Line Chart", width=500.0, height=300.0)
@@ -55,7 +67,9 @@ object TimeSeries {
       .select(byExprs ++ Seq(col("_kvs." + key), col("_kvs." + value)): _*)
   }
 
-  /** Makes sure only ERROR messages get logged to avoid log spam. */
+  /**
+    * Makes sure only ERROR messages get logged to avoid log spam.
+    */
   def setupLogging() = {
     import org.apache.log4j.{Level, Logger}
     val rootLogger = Logger.getRootLogger()
@@ -70,15 +84,15 @@ object TimeSeries {
 
     import spark.implicits._
 
-    //if (args.length < 2) {
-    //  System.err.println("Correct usage: Program_Name inputPath outputPath")
-    //  System.exit(1)
-    //}
+    if (args.length < 1) {
+      System.err.println("Correct usage: Program_Name inputPath")
+      System.exit(1)
+    }
 
     // Get rid of log spam (should be called after the context is set up)
     setupLogging()
 
-    val inputPath = "data/train_1.csv" // args(0)
+    val inputPath = args(0)
     println("inputPath: " + inputPath)
 
     val pageCol = "page"
@@ -91,7 +105,7 @@ object TimeSeries {
     println("Loading input file")
     val rawDF = spark.read
       .format("csv")
-      .option("header", "true") // first line in file has headers
+      .option("header", "true")
       .option("inferSchema","true")
       .option("nullValue","defaultvalue")
       .load(inputPath)
@@ -101,8 +115,6 @@ object TimeSeries {
 
     // Get column names
     val colNames = rawDF.columns.toSeq
-
-    //val validationColNames = colNames.slice(colNames.)
 
     df = df.drop(colNames.tail(0))
 
@@ -116,7 +128,7 @@ object TimeSeries {
     //df.sort(col(totalCol).desc).show()
 
     // Get top 10 pages
-    var topPagesList = df.sort(col(totalCol).desc).take(10000).map(x => x.getString(0))
+    var topPagesList = df.sort(col(totalCol).desc).take(100).map(x => x.getString(0))
 
     df = df.filter(col(pageCol).isin(topPagesList : _*))
 
@@ -129,55 +141,53 @@ object TimeSeries {
     val startDate = LocalDateTime.parse(startDateStr, formatter)
     val endDate = LocalDateTime.parse(endDateStr, formatter)
 
+    // train until this date
     val trainUntil = endDate.minusDays(daysToForecast)
 
+    // train
     val dateIndex = DateTimeIndex.uniformFromInterval(
       ZonedDateTime.of(startDate, ZoneId.of("Z")),
       ZonedDateTime.of(startDate, ZoneId.of("Z")),
       new DayFrequency(1)
     )
 
+    // Build rdd in a way that spark-ts library accepts
+    // Format (String, Vector[])
+    // String has key and Vector holds timeseries information
     val timeseriesRDD = df.map { line: Row =>
       val cols: Seq[Any] = line.toSeq
+      // Head has page title
       val key = cols.head
+      // Tail has all date columns
       val hits = cols.tail.toArray
       val series = new DenseVector(hits.map(_.toString.toDouble))
       (key.toString, series.asInstanceOf[Vector])
     }.rdd
 
+    // Once the rdd is built feed it to library by passing build the DF
     val tsRDD: TimeSeriesRDD[String] = new TimeSeriesRDD[String](dateIndex, timeseriesRDD)
 
     // Find a sub-slice between two dates
     val subslice = tsRDD.slice(startDate.atZone(zoneId), trainUntil.atZone(zoneId))
 
     // Fill in missing values based on linear interpolation
-
-    //val filledRDD = subslice.fill("linear")
-
-    //tsRDD.toDF().show(1)
-    //subslice.toDF().show(1)
-
-    // filledRDD.toObservationsDataFrame
-
-    print("Hello!!")
+    val filledRDD = subslice.fill("linear")
 
     val timeseriesDF = subslice.mapSeries { vector => {
       val newVec = new DenseVector(vector.toArray.map(x => if (x.equals(Double.NaN)) 0 else x))
       val arimaModel = ARIMA.fitModel(1, 0, 1, newVec)
       //val arimaModel = ARIMA.autoFit(newVec)
-      //print(newVec.size, daysToForecast)
       val forecasted = arimaModel.forecast(newVec, daysToForecast)
 
-      //println ("forecast", forecasted.size - daysToForecast, forecasted.size, forecasted.size - (daysToForecast + 1), forecasted.size - 1)
       new DenseVector(forecasted.toArray.slice(forecasted.size - (daysToForecast + 1), forecasted.size))
     }
     }.toDF(pageCol, predictedCol)
 
     //timeseriesDF.show()
 
-    //val dateFormat = new SimpleDateFormat("yyyy-MM-dd")
     val simpleDateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd")
 
+    // Build array of forecasted dates that we use to explode DenseVector to columns
     val forecastDates = (for (f <- 1 to daysToForecast) yield trainUntil.plusDays(f)).map(d => d.format(simpleDateFormat))
 
     var totalErrorSquare = 0.0
@@ -194,88 +204,55 @@ object TimeSeries {
     var arrDF = timeseriesDF.withColumn("prediction_arr", toArrUdf('prediction))
 
 
+    // Build dataframe using the above generated dates by zipping it with the obtained dataframe
+    // fdf - forecasted df
     var fdf = forecastDates.zipWithIndex.foldLeft(arrDF) {
       (df, column) => {
         df.withColumn(column._1, col("prediction_arr")(column._2))
       }
     }
 
-    //fdf.show()
+    fdf.show()
 
+    // as we are now done with prediction and prediction_arr columns, let drop them
     fdf = fdf.drop("prediction").drop("prediction_arr")
-
-    //fdf.show()
-
-    //val df2 = timeseriesDF.withColumn(predictedCol, vecToSeq($"prediction"))
-    //df2.show()
-    //timeseriesDF.select($"page", split($"prediction")).show
-
-    //for (i <- (predicted.size - period) until predicted.size) {
-    //  val errorSquare = Math.pow(predicted(i) - amounts(i), 2)
-    //  println(monthes(i) + ":\t\t" + predicted(i) + "\t should be \t" + amounts(i) + "\t Error Square = " + errorSquare)
-    //  totalErrorSquare += errorSquare
-    //}
-    //println("Root Mean Square Error: " + Math.sqrt(totalErrorSquare/period))
-
-    //print(timeseriesDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values)
-
-    //(forecastDates zip timeseriesDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values)
-    //  .map { case (date, hits) => (date, hits): (String, Double) }.toList
 
     println("forecated dates" ,forecastDates)
 
-    //println("===========")
-    //fdf.collect().map (row => {
-    //  val page = row.getString(0)
-    //  print("page", page)
-    //  val value = row.getAs[Double](1)
-    //  print("value", value)
-    //})
-
-
-    //val ttf = timeseriesDF.select(predictedCol).collect().head.get(0).asInstanceOf[DenseVector].values
-    //  .map { case (hits) => (hits): (Double) }.toList
-
-    //print(ttf)
-    val size: Long = fdf.count
-
-
-    // Add type column to dataframe
+    // Now we got forecasted results and we already had actual values to those dates.
+    // So now lets combine those two dataframes together using UNION method.
+    // As it will be difficult to identify rows from forecasted and acutal dataframes we are introducing a new column
+    // to identity them while plotting the graph (actual/forecated)
+    // Below code adds type column to dataframe
     val actualDF = df.select(pageCol, forecastDates: _*).withColumn("type", lit("actual"))
     fdf = fdf.withColumn("type", lit("forecasted"))
 
-
     //fdf.show()
 
+    // Join both dataframes using UNION
     val combinedDFs = Seq(actualDF, fdf).reduce(_ union _) //actualDF union fdf
+
     //combinedDFs.show(200)
 
+    // Now convert the resultant dataframe in timeseries to observations format
+    // We are doing this only for the sake of plotting the data onto graphs using Vegas as they don't support timeseries
+    // format
     val combinedDFObservationFormat = toObservationsFormat(combinedDFs, Seq(pageCol, typeCol), "date", "views")
 
-    val random = new Random
+    // Plot top 3 pages data to see our forecasting/predictions
     val sampleSize = 3
     var index = 0
 
     while (index < sampleSize) {
-      val rNum = 1 + random.nextInt(size.toInt)
       val selectedPage = topPagesList(index)
-      print (selectedPage)
+      println (selectedPage)
+      // filter the page for the given title
       var filteredDF = combinedDFObservationFormat.filter(col(pageCol) === selectedPage)
       //filteredDF.show()
       filteredDF = filteredDF.drop(pageCol)
       plotDF(filteredDF, selectedPage, typeCol, "date", "views")
       index = index + 1
     }
-
-
-    //val tempObsDF = toObservationsFormat(tempDF, Seq("type"), "date", "views")
-
-    //val toObsDF = toObservationsFormat(fdf, Seq(pageCol, typeCol), "date", "views")
-
-    //var actObsDF = toObservationsFormat(df, Seq(pageCol, typeCol), "date", "views")
-    //toObsDF.show()
-    //plotDF(toObsDF, "Forecasted", "page", "date", "views")
-    //plotDF(actObsDF, "Actual", "page", "date", "views")
   }
 }
 
